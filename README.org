@@ -1,0 +1,33 @@
+<#+AUTHOR: phdenzel
+#+TITLE: wireguard-install
+#+DATE: 2022-05-24 Tue
+#+OPTIONS: author:nil title:t date:nil timestamp:nil toc:nil num:nil \n:nil
+
+This is yet another wireguard install script for linux. During the
+process of installing wireguard on my own server, I've written down
+the individual steps. When I was finished, I was left with a working
+(and tested) install script, so there you go...
+
+
+** Usage
+
+The Makefile is here For ease of use. Simply type
+
+#+begin_src shell
+make install
+#+end_src
+
+to set up a server and client configuration interactively. For
+multiple clients simply repeat the command as many times as you have
+clients and choose different client names each time.
+
+For a local install, use
+#+begin_src shell
+  make dirs
+  sudo WG_INSTALL_PREFIX="$(uname -n)/etc"" bash wireguard-install
+#+end_src
+
+Once you're happy with the local configuration, install it with
+#+begin_src shell
+  make push
+#+end_src
