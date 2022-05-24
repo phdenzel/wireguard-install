@@ -1,4 +1,4 @@
-<#+AUTHOR: phdenzel
+#+AUTHOR: phdenzel
 #+TITLE: wireguard-install
 #+DATE: 2022-05-24 Tue
 #+OPTIONS: author:nil title:t date:nil timestamp:nil toc:nil num:nil \n:nil

@@ -1,16 +1,16 @@
 #!/bin/bash
 # Wireguard install script for Arch Linux
-
-WG_CONF=${WG_CONF:-"/etc/wireguard/wg0.conf"}
-WG_PRIVKEY=${WG_PRIVKEY:-"/etc/wireguard/private.key"}
-WG_PUBKEY=${WG_PUBKEY:-"/etc/wireguard/public.key"}
-WG_PEERS_DIR=${WG_PEERS_DIR:-"/etc/wireguard/peers"}
+WG_INSTALL_PREFIX=${WG_INSTALL_PREFIX:-"/etc"}
+WG_CONF=${WG_CONF:-"$WG_INSTALL_PREFIX/wireguard/wg0.conf"}
+WG_PRIVKEY=${WG_PRIVKEY:-"$WG_INSTALL_PREFIX/wireguard/private.key"}
+WG_PUBKEY=${WG_PUBKEY:-"$WG_INSTALL_PREFIX/wireguard/public.key"}
+WG_PEERS_DIR=${WG_PEERS_DIR:-"$WG_INSTALL_PREFIX/wireguard/peers"}
 IPv4_RANGE="10.8.0"
 IPv4_PREFIX="24"
 IPv6_DATE="1652357852527549848"
 IPv6_PREFIX="64"
 WG_KEEPALIVE=${WG_KEEPALIVE:-"15"}
-WG_SYSCTLCONF=${WG_SYSCTLCONF:-"/etc/sysctl.d/99-wireguard.conf"}
+WG_SYSCTLCONF=${WG_SYSCTLCONF:-"$WG_INSTALL_PREFIX/sysctl.d/99-wireguard.conf"}
 
 
 # Ensure script is run in superuser env
