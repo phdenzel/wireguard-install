@@ -24,7 +24,7 @@ clients and choose different client names each time.
 For a local install, use
 #+begin_src shell
   make dirs
-  sudo WG_INSTALL_PREFIX="$(uname -n)/etc"" bash wireguard-install
+  sudo WG_INSTALL_PREFIX="$(uname -n)/etc" bash wireguard-install
 #+end_src
 
 Once you're happy with the local configuration, install it with
