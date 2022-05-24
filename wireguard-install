@@ -1,0 +1,399 @@
+#!/bin/bash
+# Wireguard install script for Arch Linux
+
+WG_CONF=${WG_CONF:-"/etc/wireguard/wg0.conf"}
+WG_PRIVKEY=${WG_PRIVKEY:-"/etc/wireguard/private.key"}
+WG_PUBKEY=${WG_PUBKEY:-"/etc/wireguard/public.key"}
+WG_PEERS_DIR=${WG_PEERS_DIR:-"/etc/wireguard/peers"}
+IPv4_RANGE="10.8.0"
+IPv4_PREFIX="24"
+IPv6_DATE="1652357852527549848"
+IPv6_PREFIX="64"
+WG_KEEPALIVE=${WG_KEEPALIVE:-"15"}
+WG_SYSCTLCONF=${WG_SYSCTLCONF:-"/etc/sysctl.d/99-wireguard.conf"}
+
+
+# Ensure script is run in superuser env
+if ! grep -q sbin <<< "$PATH"; then
+	  echo '$PATH does not include sbin. Try using "su -" instead of "su".'
+	  exit
+fi
+
+if [[ "$EUID" -ne 0 ]]; then
+	echo "This installer needs to be run with superuser privileges."
+	exit
+fi
+
+date_to_ipv6() {
+    local timestamp
+    local machine_id
+    local hash_id
+    machine_id=$(cat /var/lib/dbus/machine-id)
+    timestamp=${1:-$IPv6_DATE}
+    [ -z "$timestamp" ] && timestamp=$(date +%s%N)
+    hash_id=$(printf "$timestamp$machine_id" | sha1sum | sed 's/-//g' | xargs | cut -c 31-)
+    IPv6_RANGE=$(echo "fd$hash_id" | sed 's/..../&:/g;s/:$//')
+    echo "$IPv6_RANGE"
+}
+
+y-n-prompt() {
+    local query prompt default reply
+    query="${1:-Proceed?}"
+    if [[ ${2:-} = 'Y' ]]; then
+        prompt='Y/n'
+        default='Y'
+    elif [[ ${2:-} = 'N' ]]; then
+        prompt='y/N'
+        default='N'
+    else
+        prompt='y/n'
+        default=''
+    fi
+    while true; do
+        # prompt
+        echo -n "$query [$prompt] "
+        # read input
+        read -r reply < /dev/tty
+        # default answer
+        if [[ -z $reply ]]; then
+            reply=$default
+        fi
+        # check reply
+        case "$reply" in
+            Y*|y*) return 0 ;;
+            N*|n*) return 1 ;;
+        esac
+    done
+}
+
+
+get_public_ip () {
+    local public_ip_candidate=$(curl -m 10 -4Ls "http://ip1.dynupdate.no-ip.com/")
+    echo
+    read -p "Public IPv4 address / hostname [$public_ip_candidate]: " public_ip
+		# If the checkip service is unavailable and user didn't provide input, ask again
+		until [[ -n "$public_ip_candidate" || -n "$public_ip" ]]; do
+			echo "Invalid input."
+			read -p "Public IPv4 address / hostname: " public_ip
+		done
+		[[ -z "$public_ip" ]] && public_ip="$public_ip_candidate"
+}
+
+
+get_listen_port() {
+    echo
+    echo "What port should WireGuard listen to?"
+	  read -p "Port [51820]: " listen_port
+	  until [[ -z "$listen_port" || "$listen_port" =~ ^[0-9]+$ && "$listen_port" -le 65535 ]]; do
+		    echo "$listen_port: invalid port."
+		    read -p "Port [51820]: " listen_port
+	  done
+	  [[ -z "$listen_port" ]] && listen_port="51820"
+}
+
+
+get_client_name() {
+    local client_default=${1:-"client"}
+    echo
+    read -p "Choose a client name [$client_default]: " client_input
+    client_name=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$client_input")
+    [[ -z $client_name ]] && client_name="$client_default"
+}
+
+
+new_client_dns () {
+		resolv_conf=${1:-"/etc/resolv.conf"}
+    local dns_i=$(cat "$resolv_conf" | grep -v '^#\|^;' "$resolv_conf" | grep '^nameserver' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | xargs | sed -e 's/ /, /g')
+    local current_dns=${1:-$dns_i}
+    echo
+	  echo "Select a DNS server for the client:"
+	  echo "   1) Current system resolver ($current_dns)"
+	  echo "   2) Google"
+	  echo "   3) 1.1.1.1"
+	  echo "   4) OpenDNS"
+	  echo "   5) Quad9"
+	  echo "   6) AdGuard"
+	  read -p "DNS server [1]: " nameserver
+	  until [[ -z "$dns" || "$dns" =~ ^[1-6]$ ]]; do
+		    echo "$dns: invalid selection."
+		    read -p "DNS server [1]: " nameserver
+	  done
+		# DNS
+	  case "$nameserver" in
+		    1|"") nameserver="$current_dns" ;;
+		    2) nameserver="8.8.8.8, 8.8.4.4" ;;
+		    3) nameserver="1.1.1.1, 1.0.0.1" ;;
+		    4) nameserver="208.67.222.222, 208.67.220.220" ;;
+		    5) nameserver="9.9.9.9, 149.112.112.112" ;;
+		    6) nameserver="94.140.14.14, 94.140.15.15" ;;
+	  esac
+}
+
+
+select_firewalld_zone() {
+    local zone
+    local index
+    local counter=0
+    firewalld_zone=${1:-""}
+    if [ -z "$firewalld_zone" ]; then
+        echo
+	      echo "Firewalld zone for masquerade rules:"
+        zones=($(firewall-cmd --get-zones))
+        for z in "${zones[@]}"; do
+            counter=$((counter + 1))
+	          echo "   $counter) $z"
+        done
+	      read -p "Firewalld zone [home]: " zone
+        N="${#zones[@]}"
+        for i in $(seq 0 $N); do
+            index=$((i - 1))
+            if [ "$i" = "$zone" ]; then
+                firewalld_zone="${zones[$index]}"
+	          fi
+        done
+        [ -z "$firewalld_zone" ] && firewalld_zone="home"
+    fi
+}
+
+
+generate_keypair() {
+    local private_key_file=${1:-"$WG_PRIVKEY"}
+    local public_key_file=${2:-"$WG_PUBKEY"}
+    local preshared_key_file=${3:-""}
+    VERBOSE=${4:-1}
+    if [ ! -f "$private_key_file" ]; then
+        wg genkey | tee "$private_key_file" >/dev/null
+        sudo chmod 600 "$private_key_file"
+    fi
+    if [ ! -f "$public_key_file" ]; then
+        cat "$private_key_file" | wg pubkey > "$public_key_file"
+    fi
+    if [ ! -z "$preshared_key_file" ] && [ ! -f "$preshared_key_file" ]; then
+        wg genpsk | tee "$preshared_key_file" >/dev/null
+        sudo chmod 600 "$preshared_key_file"
+    fi
+    if [ "$VERBOSE" -eq 1 ]; then
+        echo -e "# $private_key_file:\t$(cat "$private_key_file")"
+        echo -e "# $public_key_file:\t$(cat "$public_key_file")"
+        [ -f "$preshared_key_file" ] && echo -e "# $preshared_key_file:\t$(cat "$preshared_key_file")"
+    fi
+}
+
+
+replace_val_in_file() {
+    local file="$1"
+    local key="$2"
+    local val="$3"
+    sed -i "/$key/c$key"' = '"$val" "$file"
+}
+
+replace_val_in_file_range() {
+    local file="$1"
+    local rangestart="$2"
+    local rangestop="$3"
+    local key="$4"
+    local val="$5"
+    sed -i "/$rangestart"'\b/,/'"$rangestop\b/s#$key.*#$key"' = '"$val#" "$file"
+}
+
+
+generate_server_wgconf() {
+    generate_keypair "$WG_PRIVKEY" "$WG_PUBKEY"
+    local conf_file=${1:-"$WG_CONF"}
+    local sysctl_conf=${2:-"$WG_SYSCTLCONF"}
+    VERBOSE=${3:-1}
+    local private_key=$(cat "$WG_PRIVKEY")
+    IPv6_RANGE=$(date_to_ipv6)
+    local addressv4="$IPv4_RANGE.1/$IPv4_PREFIX"
+    local addressv6="$IPv6_RANGE::1/$IPv6_PREFIX"
+    if [ ! -f "$conf_file" ]; then
+        cat << EOF > "$conf_file"
+[Interface]
+PrivateKey = $private_key
+Address = $addressv4, $addressv6
+ListenPort = $listen_port
+SaveConfig = true
+EOF
+    else
+        replace_val_in_file "$conf_file" "PrivateKey" "$private_key"
+        replace_val_in_file "$conf_file" "Address" "$addressv4, $addressv6"
+        replace_val_in_file "$conf_file" "ListenPort" "$listen_port"
+    fi
+    chmod 600 "$conf_file"
+    [ "$VERBOSE" -eq 1 ] && echo -e "# Server setup:     \t$conf_file"
+    # Enable IPv4/6 forwarding for server
+    echo 'net.ipv4.ip_forward=1' > "$sysctl_conf"
+    echo 'net.ipv6.conf.all.forwarding=1' >> "$sysctl_conf"
+    [ "$VERBOSE" -eq 1 ] && echo -e "# Enable forwarding:\t$sysctl_conf"
+}
+
+
+generate_peer_wgconf() {
+    local server_file=${1:-"$WG_CONF"}
+    local server_public_key=$(cat "$WG_PUBKEY")
+    local conf_file=${2:-"$WG_PEERS_DIR/$client_name.conf"}
+    local peers_dir="$(dirname $conf_file)"
+    local peer_subname="$WG_PEERS_DIR/$client_name"
+    VERBOSE=${3:-1}
+    mkdir -p "$peers_dir"
+    # unique device IPs
+    octet=2
+    while grep AllowedIPs "$WG_CONF" | cut -d "." -f 4 | cut -d "/" -f 1 | grep -q "$octet"; do
+		    (( octet++ ))
+	  done
+    local addressv4="$IPv4_RANGE.$octet/$IPv4_PREFIX"
+    local addressv6="$IPv6_RANGE::$octet/$IPv6_PREFIX"
+    # generate key pair
+    generate_keypair "$peer_subname.private.key" "$peer_subname.public.key" "$peer_subname.preshared.key"
+    local peer_private_key="$(cat $peer_subname.private.key)"
+    local peer_public_key="$(cat $peer_subname.public.key)"
+    local preshared_key="$(cat "$peer_subname.preshared.key")"
+    if [ ! -f "$conf_file" ]; then
+        # generate client configuration
+        cat << EOF > "$conf_file"
+[Interface]
+PrivateKey = $peer_private_key
+Address = $addressv4, $addressv6
+DNS = $nameserver
+
+[Peer]
+PublicKey = $server_public_key
+PresharedKey = $preshared_key
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $public_ip:$listen_port
+PersistentKeepalive = $WG_KEEPALIVE
+EOF
+        [ "$VERBOSE" -eq 1 ] && echo -e "# Peer setup:\t$conf_file"
+        # append peer in server configuration
+        addressv4="$IPv4_RANGE.$octet/32"
+        addressv6="$IPv6_RANGE::$octet/128"
+        cat << EOF >> "$server_file"
+
+# PEER $client_name
+[Peer]
+PublicKey = $peer_public_key
+PresharedKey = $preshared_key
+AllowedIPs = $addressv4, $addressv6
+# END PEER $client_name
+EOF
+        [ "$VERBOSE" -eq 1 ] && echo -e "# Peer setup:\t$server_file"
+    else
+        # update client configuration
+        replace_val_in_file "$conf_file" "PrivateKey" "$peer_private_key"
+        replace_val_in_file "$conf_file" "Address" "$addressv4, $addressv6"
+        replace_val_in_file "$conf_file" "DNS" "$nameserver"
+        replace_val_in_file "$conf_file" "PublicKey" "$server_public_key"
+        replace_val_in_file "$conf_file" "PresharedKey" "$preshared_key"
+        replace_val_in_file "$conf_file" "AllowedIPs" "0.0.0.0/0, ::/0"
+        replace_val_in_file "$conf_file" "Endpoint" "$public_ip:$listen_port"
+        replace_val_in_file "$conf_file" "PersistentKeepalive" "$WG_KEEPALIVE"
+        [ "$VERBOSE" -eq 1 ] && echo -e "# Peer setup:\t$conf_file"
+        # update client configuration
+        addressv4="$IPv4_RANGE.$octet/32"
+        addressv6="$IPv6_RANGE::$octet/128"
+        replace_val_in_file_range "$server_file" "PEER $client_name" "END PEER $client_name" "PublicKey" "$peer_public_key"
+        replace_val_in_file_range "$server_file" "PEER $client_name" "END PEER $client_name" "PresharedKey" "$preshared_key"
+        replace_val_in_file_range "$server_file" "PEER $client_name" "END PEER $client_name" "AllowedIPs" "$addressv4, $addressv6"
+        [ "$VERBOSE" -eq 1 ] && echo -e "# Peer setup:\t$server_file"
+        
+    fi
+}
+
+
+add_firewalld_rules() {
+    [ ! -z "$1" ] && WG_CONF="$1"
+    [ ! -z "$2" ] && firewalld_zone="$2"
+    firewalld_zone=${firewalld_zone:-"home"}
+    WG_CONF=${WG_CONF:-"/etc/wireguard/wg0.conf"}
+    local interface=$(basename $WG_CONF .conf)
+    # add wireguard service to firewall
+    if ! grep -q "wireguard" <<< $(firewall-cmd --list-services); then
+        echo "# firewall-cmd --add-service=wireguard"
+        firewall-cmd --add-service=wireguard >/dev/null
+        firewall-cmd --add-service=wireguard --permanent >/dev/null
+    fi
+    # add interface device to 'trusted' or 'internal'
+    if ! grep -q "$interface" <<< $(firewall-cmd --zone=trusted --list-interfaces); then
+        echo "# firewall-cmd --zone=trusted --add-interface=wg0"
+        sudo firewall-cmd --zone=trusted --add-interface=wg0
+    fi
+    # enable automatic masquerading
+    if ! $(grep -q PostUp "$WG_CONF"); then
+        echo "# $WG_CONF << \"PostUp = firewall-cmd --zone=$firewalld_zone --add-masquerade\""
+        echo "PostUp = firewall-cmd --zone=$firewalld_zone --add-masquerade" >> "$WG_CONF"
+    fi
+    if ! grep -q PostDown "$WG_CONF"; then
+        echo "# $WG_CONF << \"PostDown = firewall-cmd --zone=$firewalld_zone --remove-masquerade\""
+        echo "PostDown = firewall-cmd --zone=$firewalld_zone --remove-masquerade" >> "$WG_CONF"
+    fi
+}
+
+
+qrencode_peer_wgconf() {
+    conf_file=${1:-"$WG_PEERS_DIR/$client_name.conf"}
+    cat "$conf_file" | qrencode -t UTF8
+    echo -e '\xE2\x86\x91 That is a QR code containing the client configuration.'
+}
+
+########################################################################## Main
+# Gather input
+get_public_ip
+echo "> $public_ip"
+
+get_listen_port
+if [ "$listen_port" != "51820" ]; then
+    echo "> $listen_port (keep in mind that non-default ports will have to be manually opened in firewalld)"
+else
+    echo "> $listen_port"
+fi;
+
+get_client_name
+echo "> $client_name"
+
+new_client_dns
+echo "> $nameserver"
+
+# Firewalld
+if ! systemctl list-units --full -all | grep -Fq "firewalld.service"; then
+    if y-n-prompt "Install the firewalld package?" Y; then
+        pacman -S firewalld
+    fi
+fi
+if ! systemctl is-active --quiet firewalld.service; then
+    if y-n-prompt "Start and enable firewalld.service?" Y; then
+        systemctl enable firewalld.service
+        systemctl start firewalld.service
+    fi
+fi
+if systemctl is-active --quiet firewalld.service; then
+    FIREWALLD_ACTIVE=1
+    echo
+    echo "# firewalld.service is active"
+fi
+
+select_firewalld_zone
+echo "> $firewalld_zone"
+
+# Start wireguard installation
+echo
+read -n1 -r -p "Press any key to start installation... "
+if [[ ! $(pacman -Q wireguard-tools) ]]; then
+    if y-n-prompt "Install the wireguard-tools package?" Y; then
+        pacman -S wireguard-tools
+    else
+        echo "This installer needs wireguard-tools! Install and run the script again" && exit 0
+    fi
+fi
+
+# Server configuration
+generate_server_wgconf "$WG_CONF" "$WG_SYSCTLCONF"
+add_firewalld_rules "$WG_CONF"
+
+# Peer configuration
+generate_peer_wgconf "$WG_CONF" "$WG_PEERS_DIR/$client_name.conf"
+qrencode_peer_wgconf "$WG_PEERS_DIR/$client_name.conf"
+
+# Enable
+if ! systemctl is-active --quiet wg-quick@wg0.service; then
+    systemctl enable --now wg-quick@wg0.service
+fi
